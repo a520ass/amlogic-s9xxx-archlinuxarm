@@ -20,7 +20,7 @@ populate_boot() {
     sudo mkimage -A arm64 -O linux -T script -C none -d "${script}" "${dir_boot}/${name}" > /dev/null
   done
   echo "  -> Writing booting configuration..."
-  local kernel='linux-aarch64-flippy'
+  local kernel='linux-aarch64-meson64'
   local conf_linux="vmlinuz-${kernel}"
   local conf_initrd="initramfs-${kernel}-fallback.uimg"
   local conf_fdt="dtbs/${kernel}/amlogic/PLEASE_SET_YOUR_DTB.dtb"
@@ -39,7 +39,7 @@ populate_boot() {
 }
 remove_non_fallback() {
   echo " => Removing non-fallback non-legacy initramfs..."
-  sudo rm -f ${dir_boot}/initramfs-linux-aarch64-flippy.{u,}img ${dir_boot}/initramfs-linux-aarch64-flippy-fallback.img
+  # sudo rm -f ${dir_boot}/initramfs-linux-aarch64-meson64.{u,}img ${dir_boot}/initramfs-linux-aarch64-meson64-fallback.img
   echo " => Removed non-fallback non-legacy initramfs"
 }
 # Actual build

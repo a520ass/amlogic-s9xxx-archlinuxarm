@@ -4,18 +4,9 @@
 [submodule "build/ampart"]
 	path = build/ampart
 	url = https://aur.archlinux.org/ampart.git
-[submodule "build/linux-aarch64-flippy"]
-	path = build/linux-aarch64-flippy
-	url = https://aur.archlinux.org/linux-aarch64-flippy.git
-[submodule "build/linux-firmware-amlogic-ophub"]
-	path = build/linux-firmware-amlogic-ophub
-	url = https://aur.archlinux.org/linux-firmware-amlogic-ophub.git
-[submodule "build/uboot-legacy-initrd-hooks"]
-	path = build/uboot-legacy-initrd-hooks
-	url = https://aur.archlinux.org/uboot-legacy-initrd-hooks.git
-[submodule "build/yaopenvfd"]
-	path = build/yaopenvfd
-	url = https://aur.archlinux.org/yaopenvfd.git
-[submodule "build/yay"]
-	path = build/yay
-	url = https://aur.archlinux.org/yay.git
+[submodule "build/yay-bin"]
+	path = build/yay-bin
+	url = https://aur.archlinux.org/yay-bin.git
+[submodule "build/frp-bin"]
+	path = build/frp-bin
+	url = https://aur.archlinux.org/frp-bin.git

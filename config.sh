@@ -3,13 +3,12 @@
 # Local config
 name_distro+='-Amlogic'
 dir_booting='booting'
+pacstrap_from_repo_pkgs+=(
+  'linux-firmware: optional firmware for some devices'
+)
 release_note_packages+=(
   'ampart:[my AUR][AUR ampart]'
-  'linux-aarch64-flippy:[my AUR][AUR linux-aarch64-flippy]'
-  'linux-firmware-amlogic-ophub:[my AUR][AUR linux-firmware-amlogic-ophub]'
-  'yaopenvfd:[my AUR][AUR yaopenvfd]'
-  'uboot-legacy-initrd-hooks:[my AUR][AUR uboot-legacy-initrd-hooks]'
-  'yay:[AUR][AUR yay]'
+  'yay-bin:[AUR][AUR yay-bin]'
 )
 blob_paths+=(
   '/etc/udev/rules.d/50-amlogic-partition-links.rules'
