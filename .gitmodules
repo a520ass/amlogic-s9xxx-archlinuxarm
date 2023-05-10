@@ -10,3 +10,5 @@
 [submodule "build/frp-bin"]
 	path = build/frp-bin
 	url = https://aur.archlinux.org/frp-bin.git
+[submodule "common/"]
+	url = https://github.com/a520ass/alarm-builder-common.git
