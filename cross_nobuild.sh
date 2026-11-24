@@ -646,11 +646,11 @@ if [[ "${#install_pkgs_bootstrap[@]}" == 0 ]]; then
 fi
     
 if [[ "${#install_pkgs_normal[@]}" == 0 ]]; then
-    install_pkgs_normal=(vim nano sudo openssh linux-aarch64-flippy-git-dtb-amlogic ampart yaopenvfd)
+    install_pkgs_normal=(vim nano sudo openssh yaopenvfd)
 fi
 
 if [[ "${#install_pkgs_kernel[@]}" == 0 ]]; then
-    install_pkgs_kernel=(linux-aarch64-{flippy-git,7ji})
+    install_pkgs_kernel=(linux-aarch64-7ji)
 fi
 
 if [[ -z "${uuid_root}" ]]; then
