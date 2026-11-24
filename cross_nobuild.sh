@@ -239,6 +239,16 @@ SigLevel = Never${pacman_mirrors}" > cache/pacman-loose.conf
     echo "[options]${pacman_config}
 SigLevel = DatabaseOptional${pacman_mirrors}" > cache/pacman-strict.conf
 
+    # Installing the initramfs tool (mkinitcpio/booster) fires its own
+    # post-transaction hook in the SAME transaction, before we can rename the
+    # hook file below. That hook either fails (booster: find on a missing
+    # /usr/lib/modules) or hangs regenerating images through slow qemu
+    # (mkinitcpio). Use NoExtract so hook files never land in the rootfs during
+    # those two installs. --hookdir only appends dirs and --nohooks needs
+    # pacman 6.0+, so neither is reliable with the static pacman here.
+    sed '/^SigLevel = DatabaseOptional$/a NoExtract = usr/share/libalpm/hooks/*' \
+        cache/pacman-strict.conf > cache/pacman-nohooks.conf
+
     # For installing local .pkg.tar.zst files that carry no detached signature
     sed 's/^SigLevel = .*/SigLevel = Never/' cache/pacman-strict.conf > cache/pacman-local.conf
 }
@@ -273,7 +283,13 @@ install_initramfs() {
     # This avoids the performance penalty if mkinitcpio runs with compression in
     # target, as qemu is not that efficient
     if [[ "${initramfs}" == 'booster' ]]; then
-        pacman_could_retry -S --config cache/pacman-strict.conf --noconfirm booster
+        # booster ships a post-transaction hook that runs regenerate_images,
+        # which does `find /usr/lib/modules`. No kernel is installed yet at
+        # this stage, so that find fails and the hook (hence this pacman run)
+        # aborts. Create the directory first so the hook finds it (empty is
+        # fine and harmless); the real image is built later in setup_kernel().
+        mkdir -p cache/root/usr/lib/modules
+        pacman_could_retry -S --config cache/pacman-nohooks.conf --noconfirm booster
         printf '%s: %s\n' \
             'compression' 'none' \
             'universal' 'true' > cache/root/etc/booster.yaml
@@ -283,13 +299,24 @@ install_initramfs() {
         # pacman fail or hang. restore it in unhack_initramfs().
         local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
         [[ -f "${mkinitcpio_install_hook}" ]] && mv "${mkinitcpio_install_hook}"{,.pacsave}
+        # Likewise disable booster's own hook: installing the kernel later
+        # would otherwise regenerate images inside the target, which is
+        # exactly what setup_kernel() does manually (and compresses). Restore
+        # it in unhack_initramfs() so the final image keeps the hook.
+        local booster_hook
+        for booster_hook in cache/root/usr/share/libalpm/hooks/*booster*.hook; do
+            [[ -f "${booster_hook}" ]] && mv "${booster_hook}"{,.pacsave}
+        done
     else
-        pacman_could_retry -S --config cache/pacman-strict.conf --noconfirm mkinitcpio
+        # The mkinitcpio package ships 90-mkinitcpio-install.hook, which fires
+        # during this very install (no kernel/preset yet) and hangs running the
+        # aarch64 generator via qemu. Install with hooks excluded via NoExtract.
+        pacman_could_retry -S --config cache/pacman-nohooks.conf --noconfirm mkinitcpio
         local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
         cp "${mkinitcpio_conf}"{,.pacsave}
         echo 'COMPRESSION=cat' >> "${mkinitcpio_conf}"
         local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
-        mv "${mkinitcpio_install_hook}"{,.pacsave}
+        [[ -f "${mkinitcpio_install_hook}" ]] && mv "${mkinitcpio_install_hook}"{,.pacsave}
     fi
 }
 
@@ -299,11 +326,16 @@ unhack_initramfs() {
             'universal' 'true' > cache/root/etc/booster.yaml
         local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
         [[ -f "${mkinitcpio_install_hook}.pacsave" ]] && mv "${mkinitcpio_install_hook}"{.pacsave,}
+        local booster_hook
+        for booster_hook in cache/root/usr/share/libalpm/hooks/*booster*.hook.pacsave; do
+            [[ -f "${booster_hook}" ]] || continue
+            mv "${booster_hook}" "${booster_hook%.pacsave}"
+        done
     else
         local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
         local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
         mv "${mkinitcpio_conf}"{.pacsave,}
-        mv "${mkinitcpio_install_hook}"{.pacsave,}
+        [[ -f "${mkinitcpio_install_hook}.pacsave" ]] && mv "${mkinitcpio_install_hook}"{.pacsave,}
     fi
 }
 
@@ -317,6 +349,29 @@ setup_kernel() {
     if [[ "${initramfs}" == 'booster' ]]; then
         chroot cache/root /usr/lib/booster/regenerate_images
     else
+        # The 90-mkinitcpio-install hook was disabled in install_initramfs()
+        # to avoid running mkinitcpio in target. That hook is also what
+        # normally creates /etc/mkinitcpio.d/*.preset when a kernel is
+        # installed, so `mkinitcpio -P` would otherwise fail with
+        # "No presets found in /etc/mkinitcpio.d". Recreate the presets
+        # ourselves from the installed kernel modules.
+        mkdir -p cache/root/etc/mkinitcpio.d
+        local module_dir kver kbase preset
+        for module_dir in cache/root/usr/lib/modules/*; do
+            [[ -d "${module_dir}" ]] || continue
+            kver=$(basename "${module_dir}")
+            kbase=$(<"${module_dir}"/pkgbase 2>/dev/null)
+            [[ -n "${kbase}" ]] || continue
+            preset="cache/root/etc/mkinitcpio.d/${kbase}.preset"
+            cat > "${preset}" <<EOF
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-${kbase}"
+PRESETS=('fallback')
+fallback_image="/boot/initramfs-${kbase}-fallback.img"
+fallback_options="-S autodetect"
+EOF
+            echo "=> Created mkinitcpio preset '${kbase}' for kernel ${kver}"
+        done
         chroot cache/root mkinitcpio -P
     fi
     # Manually compress
@@ -746,10 +801,15 @@ if [[ "${#install_pkgs_bootstrap[@]}" == 0 ]]; then
 fi
     
 if [[ "${#install_pkgs_normal[@]}" == 0 ]]; then
-    install_pkgs_normal=(vim nano sudo openssh)
+    # linux-aarch64-flippy-git-dtb-amlogic and ampart were dropped from the
+    # 7Ji repo; use ampart-git which is still published there.
+    install_pkgs_normal=(vim nano sudo openssh ampart-git yaopenvfd)
 fi
 
 if [[ "${#install_pkgs_kernel[@]}" == 0 && "${#install_pkgs_kernel_pkg[@]}" == 0 ]]; then
+    # flippy-git was dropped from the 7Ji repo, so only 7ji remains as the
+    # default repo kernel. If the user supplied local kernel packages, don't
+    # add a default one: their packages become the kernel set.
     install_pkgs_kernel=(linux-aarch64-7ji)
 fi
 
@@ -763,7 +823,7 @@ fi
 uuid_boot_mkfs=${uuid_boot::8}
 uuid_boot_mkfs=${uuid_boot_mkfs^^}
 uuid_boot_specifier="${uuid_boot_mkfs::4}-${uuid_boot_mkfs:4}"
-initramfs="${initramfs:-initramfs}"
+initramfs="${initramfs:-booster}"
 
 case "${role}" in
     parent) work_parent;;
