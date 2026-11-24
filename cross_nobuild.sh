@@ -763,7 +763,7 @@ fi
 uuid_boot_mkfs=${uuid_boot::8}
 uuid_boot_mkfs=${uuid_boot_mkfs^^}
 uuid_boot_specifier="${uuid_boot_mkfs::4}-${uuid_boot_mkfs:4}"
-initramfs="${initramfs:-booster}"
+initramfs="${initramfs:-initramfs}"
 
 case "${role}" in
     parent) work_parent;;
