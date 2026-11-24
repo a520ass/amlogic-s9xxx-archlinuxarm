@@ -13,6 +13,8 @@ Build ArchLinux ARM images on an x86_64 host, rootless
 
   --install <pkg>           install the package into target image, can be specified multiple times
   --install-kernel <pkg>    install the kernel package into target image, also create booting configurations
+  --install-kernel-pkg <url|path>  download (if URL) a .pkg.tar.zst kernel package and install it with pacman -U, can be specified multiple times
+  --install-local-pkg <url|path>   download (if URL) a .pkg.tar.zst package and install it with pacman -U, no boot config, can be specified multiple times
   --install-bootstrap <pkg> install the package into target image at bootstrap stage, can be specified multiple times
   --role parent/child/grandchild
   --uuid-root <uuid>        uuid to be used for root ext4 fs
@@ -236,6 +238,9 @@ SigLevel = Never${pacman_mirrors}" > cache/pacman-loose.conf
 
     echo "[options]${pacman_config}
 SigLevel = DatabaseOptional${pacman_mirrors}" > cache/pacman-strict.conf
+
+    # For installing local .pkg.tar.zst files that carry no detached signature
+    sed 's/^SigLevel = .*/SigLevel = Never/' cache/pacman-strict.conf > cache/pacman-local.conf
 }
 
 enable_network() {
@@ -272,6 +277,12 @@ install_initramfs() {
         printf '%s: %s\n' \
             'compression' 'none' \
             'universal' 'true' > cache/root/etc/booster.yaml
+        # base pulls in mkinitcpio and its install hook. With booster we still
+        # must disable that hook, otherwise installing a kernel package later
+        # triggers mkinitcpio on the host (where it cannot run), which makes
+        # pacman fail or hang. restore it in unhack_initramfs().
+        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
+        [[ -f "${mkinitcpio_install_hook}" ]] && mv "${mkinitcpio_install_hook}"{,.pacsave}
     else
         pacman_could_retry -S --config cache/pacman-strict.conf --noconfirm mkinitcpio
         local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
@@ -286,6 +297,8 @@ unhack_initramfs() {
     if [[ "${initramfs}" == 'booster' ]]; then
         printf '%s: %s\n' \
             'universal' 'true' > cache/root/etc/booster.yaml
+        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
+        [[ -f "${mkinitcpio_install_hook}.pacsave" ]] && mv "${mkinitcpio_install_hook}"{.pacsave,}
     else
         local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
         local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
@@ -373,6 +386,75 @@ DEFAULT ${install_pkgs_kernel[0]}" > "${conf}"
 
 install_pkgs() {
     pacman_could_retry -S --config cache/pacman-strict.conf --noconfirm "${install_pkgs_kernel[@]}" "${install_pkgs_normal[@]}"
+}
+
+install_kernel_pkgs() {
+    # Download (or copy) user-supplied .pkg.tar.zst kernel packages, install
+    # them with pacman -U, and register their pkgbase into install_pkgs_kernel
+    # so setup_kernel()/setup_extlinux() build the initramfs and boot entries.
+    [[ ${#install_pkgs_kernel_pkg[@]} -eq 0 ]] && return
+    local src file name pkgbase seen duplicated
+    for src in "${install_pkgs_kernel_pkg[@]}"; do
+        if [[ "${src}" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+            name="${src##*/}"
+            name="${name%%\?*}"
+            [[ -n "${name}" ]] || { echo "ERROR: Failed to get file name from '${src}'"; exit 1; }
+            file="cache/kernel-pkg/${name}"
+            mkdir -p cache/kernel-pkg
+            dl "${src}" "${file}"
+        else
+            file="${src}"
+        fi
+        [[ -f "${file}" ]] || { echo "ERROR: Kernel package '${file}' not found"; exit 1; }
+        [[ "${file}" == *.pkg.tar.zst ]] || echo "Warning: '${file}' does not look like a .pkg.tar.zst"
+
+        # Local packages have no detached signature, so relax SigLevel via a
+        # dedicated config that keeps the repos for dependency resolution.
+        pacman_could_retry -U --config cache/pacman-local.conf --noconfirm "${file}"
+
+        # setup_kernel() compresses initramfs by kernel name, fall back to
+        # pkgname when the package is not a split package (no pkgbase).
+        pkgbase=$(bsdtar -xOf "${file}" .PKGINFO 2>/dev/null | sed -n 's/^pkgbase = //p')
+        [[ -n "${pkgbase}" ]] || pkgbase=$(bsdtar -xOf "${file}" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p')
+        if [[ -n "${pkgbase}" ]]; then
+            duplicated=''
+            for seen in "${install_pkgs_kernel[@]}"; do
+                [[ "${seen}" == "${pkgbase}" ]] && duplicated='yes' && break
+            done
+            [[ -n "${duplicated}" ]] || install_pkgs_kernel+=("${pkgbase}")
+            echo "=> Installed and registered kernel '${pkgbase}' from '${file}'"
+        else
+            echo "Warning: failed to read .PKGINFO from '${file}', boot config may need manual setup"
+        fi
+    done
+}
+
+install_local_pkgs() {
+    # Download (or copy) arbitrary user-supplied .pkg.tar.zst packages and
+    # install them with pacman -U. Unlike install_kernel_pkgs() these are not
+    # registered as kernels, so no initramfs / boot entry is generated for
+    # them. All packages are passed to a single -U call so dependencies
+    # between the supplied packages can be resolved together.
+    [[ ${#install_pkgs_local[@]} -eq 0 ]] && return
+    local src file name
+    local files=()
+    mkdir -p cache/local-pkg
+    for src in "${install_pkgs_local[@]}"; do
+        if [[ "${src}" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
+            name="${src##*/}"
+            name="${name%%\?*}"
+            [[ -n "${name}" ]] || { echo "ERROR: Failed to get file name from '${src}'"; exit 1; }
+            file="cache/local-pkg/${name}"
+            dl "${src}" "${file}"
+        else
+            file="${src}"
+        fi
+        [[ -f "${file}" ]] || { echo "ERROR: Package '${file}' not found"; exit 1; }
+        [[ "${file}" == *.pkg.tar.zst ]] || echo "Warning: '${file}' does not look like a .pkg.tar.zst"
+        echo "=> Adding package '${file}'"
+        files+=("${file}")
+    done
+    pacman_could_retry -U --config cache/pacman-local.conf --noconfirm "${files[@]}"
 }
 
 cleanup_pkgs() {
@@ -498,6 +580,12 @@ spawn_and_wait() {
     for arg in "${install_pkgs_kernel[@]}"; do
         args+=(--install-kernel "$arg")
     done
+    for arg in "${install_pkgs_kernel_pkg[@]}"; do
+        args+=(--install-kernel-pkg "$arg")
+    done
+    for arg in "${install_pkgs_local[@]}"; do
+        args+=(--install-local-pkg "$arg")
+    done
     # Note: the options --map-users and --map-groups were added to unshare.1 in 
     # util-linux 2.38, which was released on Mar 28, 2022. But the main distro
     # I aim, Ubuntu 22.04, which is what Github Actions use, packs an older
@@ -563,6 +651,8 @@ work_child() {
     bootstrap_root
     install_initramfs
     install_pkgs
+    install_kernel_pkgs
+    install_local_pkgs
     setup_root
     setup_kernel
     setup_extlinux
@@ -579,6 +669,8 @@ work_child() {
 install_pkgs_bootstrap=()
 install_pkgs_normal=()
 install_pkgs_kernel=()
+install_pkgs_kernel_pkg=()
+install_pkgs_local=()
 build_id=''
 uuid_root=''
 uuid_boot=''
@@ -604,6 +696,14 @@ while [[ $i -lt ${argc} ]]; do
         --install-kernel)
             i=$(( $i + 1 ))
             install_pkgs_kernel+=("${argv[$i]}")
+            ;;
+        --install-kernel-pkg)
+            i=$(( $i + 1 ))
+            install_pkgs_kernel_pkg+=("${argv[$i]}")
+            ;;
+        --install-local-pkg)
+            i=$(( $i + 1 ))
+            install_pkgs_local+=("${argv[$i]}")
             ;;
         --role)
             i=$(( $i + 1 ))
@@ -646,10 +746,10 @@ if [[ "${#install_pkgs_bootstrap[@]}" == 0 ]]; then
 fi
     
 if [[ "${#install_pkgs_normal[@]}" == 0 ]]; then
-    install_pkgs_normal=(vim nano sudo openssh yaopenvfd)
+    install_pkgs_normal=(vim nano sudo openssh)
 fi
 
-if [[ "${#install_pkgs_kernel[@]}" == 0 ]]; then
+if [[ "${#install_pkgs_kernel[@]}" == 0 && "${#install_pkgs_kernel_pkg[@]}" == 0 ]]; then
     install_pkgs_kernel=(linux-aarch64-7ji)
 fi
 
