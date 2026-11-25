@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-echo "=== cross_nobuild.sh revision 20261125c (root + chroot, hook-generated initramfs) ===" >&2
+echo "=== cross_nobuild.sh revision 20261125d (root + chroot, hook-generated initramfs) ===" >&2
 
 # The script runs as real root. After the bootstrap stage (which installs the
 # base system via the host static pacman), every further pacman run happens
@@ -82,11 +82,27 @@ dump_binary_from_repo() { # 1: repo url, 2: repo name, 3: pkgname, 4: local bin,
     ln -sf "$4-${ver}" bin/"$4"
 }
 
+unmount_root_all() {
+    # Detach every mount created under cache/root, then the tmpfs root itself.
+    # cache/root is a mount point (mount_root() mounts a tmpfs there), so it
+    # MUST be unmounted before rm -rf, otherwise rm fails with
+    # "Device or resource busy" even though no process is actually using it.
+    umount --lazy cache/root/etc/resolv.conf 2>/dev/null || true
+    umount --lazy cache/root/proc 2>/dev/null || true
+    local node
+    for node in full null random tty urandom zero pts; do
+        umount --lazy cache/root/dev/"${node}" 2>/dev/null || true
+    done
+    # Clean unmount first, lazy detach as a fallback if something in the
+    # chroot still holds the mount. Either way the mount point is gone before
+    # we try to remove the directory.
+    umount cache/root 2>/dev/null || umount --lazy cache/root 2>/dev/null || true
+}
+
 cleanup_build() {
     echo "=> Cleaning up before exiting..."
     umount_root_sub || true
-    umount --lazy cache/root/etc/resolv.conf 2>/dev/null || true
-    umount --lazy cache/root 2>/dev/null || true
+    unmount_root_all || true
     rm -rf cache/root
 }
 
@@ -595,6 +611,10 @@ image_root() {
 }
 
 cleanup_cache() {
+    # The success path clears the EXIT trap, so cleanup_build() never runs.
+    # Unmount cache/root here too, otherwise `rm -rf cache` hits
+    # "Device or resource busy" on the still-mounted tmpfs root.
+    unmount_root_all || true
     rm -rf cache
 }
 
