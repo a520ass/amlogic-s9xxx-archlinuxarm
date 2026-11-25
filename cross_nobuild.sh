@@ -1,13 +1,21 @@
 #!/bin/bash -e
 
-# The script would run as three different roles:
-# 1 (role=parent, default). The one that user starts runs in the parent namespace, it spawns a child with unshared user,pid,mount namespaces
-# 2 (role=child). The second one runs in the child namespace, it sets up mounts 
+echo "=== cross_nobuild.sh revision 20261125c (root + chroot, hook-generated initramfs) ===" >&2
+
+# The script runs as real root. After the bootstrap stage (which installs the
+# base system via the host static pacman), every further pacman run happens
+# INSIDE the chroot, so alpm hooks and scriptlets execute natively in the
+# target and the initramfs (booster or mkinitcpio) is generated there too.
 
 # functions
 help() {
     echo '
-Build ArchLinux ARM images on an x86_64 host, rootless
+Build ArchLinux ARM images. Must run as root (sudo). Host arch is auto-detected:
+x86_64 hosts cross-build (archlinuxcn static pacman), aarch64 hosts build natively (Manjaro ARM static pacman).
+After the bootstrap stage the script chroots into the target rootfs, so all
+packages, alpm hooks and the initramfs generation (booster or mkinitcpio) run
+natively inside the target. On an x86_64 host qemu-user-static with binfmt_misc
+must be installed for the chroot to work.
 
 ./cross_nobuild.sh
 
@@ -16,7 +24,6 @@ Build ArchLinux ARM images on an x86_64 host, rootless
   --install-kernel-pkg <url|path>  download (if URL) a .pkg.tar.zst kernel package and install it with pacman -U, can be specified multiple times
   --install-local-pkg <url|path>   download (if URL) a .pkg.tar.zst package and install it with pacman -U, no boot config, can be specified multiple times
   --install-bootstrap <pkg> install the package into target image at bootstrap stage, can be specified multiple times
-  --role parent/child/grandchild
   --uuid-root <uuid>        uuid to be used for root ext4 fs
   --uuid-boot <uuid>        uuid to be used for boot fat32 fs, only first 8 chars used
   --build-id <id>           a string id for the build
@@ -75,40 +82,30 @@ dump_binary_from_repo() { # 1: repo url, 2: repo name, 3: pkgname, 4: local bin,
     ln -sf "$4-${ver}" bin/"$4"
 }
 
-reap_children() { #1 kill arg
-    local children child
-    local i=0
-    while [[ $i -lt 100 ]]; do
-        children=($(pgrep -P$$))
-        if [[ "${#children[@]}" -eq 1 ]]; then # Only pgrep
-            return
-        fi
-        for child in "${children[@]}"; do
-            kill "$@" "${child}" 2>/dev/null || true
-        done
-        i=$(( $i + 1 ))
-        sleep 1
-    done
-}
-
-cleanup_parent() {
-    echo "=> Cleaning up before exiting (parent)..."
-    # The root mount only lives inside the child namespace, no need to umount
+cleanup_build() {
+    echo "=> Cleaning up before exiting..."
+    umount_root_sub || true
+    umount --lazy cache/root/etc/resolv.conf 2>/dev/null || true
+    umount --lazy cache/root 2>/dev/null || true
     rm -rf cache/root
-    reap_children
 }
 
-cleanup_child() {
-    echo "=> Cleaning up before exiting (child)..."
-    mount proc /proc -t proc -o nosuid,noexec,nodev
-    reap_children -9
-}
-
-pacman_could_retry() {
-    if ! bin/pacman "$@"; then
-        echo "Warning: pacman command failed to execute correctly, retry once"
-        bin/pacman "$@"
+pacman_could_retry() { # host-side static pacman, only used for the bootstrap stage
+    echo ">>> [$(date -u +%H:%M:%S)] pacman BEGIN: $*" >&2
+    if ! timeout 900 bin/pacman "$@"; then
+        echo ">>> [$(date -u +%H:%M:%S)] pacman FAILED/TIMEOUT, retry once: $*" >&2
+        timeout 900 bin/pacman "$@"
     fi
+    echo ">>> [$(date -u +%H:%M:%S)] pacman END: $*" >&2
+}
+
+pacman_chroot() { # pacman inside the target rootfs, hooks run natively there
+    echo ">>> [$(date -u +%H:%M:%S)] chroot pacman BEGIN: $*" >&2
+    if ! timeout 1800 chroot cache/root pacman "$@"; then
+        echo ">>> [$(date -u +%H:%M:%S)] chroot pacman FAILED/TIMEOUT, retry once: $*" >&2
+        timeout 1800 chroot cache/root pacman "$@"
+    fi
+    echo ">>> [$(date -u +%H:%M:%S)] chroot pacman END: $*" >&2
 }
 
 get_uid_gid() {
@@ -128,27 +125,11 @@ check_identity_root() {
     fi
 }
 
-check_identity_non_root() {
-    get_uid_gid
-    if [[ "${uid}" == 0 ]]; then
-        echo "ERROR: Not allowed to run as root (UID = 0)"
-        exit 1
-    fi
-    if [[ "${gid}" == 0 ]]; then
-        echo "ERROR: Not allowed to run as GID = 0"
-        exit 1
-    fi
-}
-
-check_identity_map_root() {
-    check_identity_root
-    if touch /sys/sys_write_test; then
-        echo "Child: ERROR: We can write to /sys, refuse to continue as real root"
-        exit 1
-    fi
-}
-
 config_repos() {
+    # Prebuilt static pacman for the host. x86_64 comes from archlinuxcn.
+    # aarch64 has no prebuild in archlinuxcn/ALARM, but Manjaro ARM ships
+    # one, which enables building natively on an aarch64 host (no qemu).
+    mirror_pacman_static=${mirror_pacman_static:-https://ftp.tsukuba.wide.ad.jp/manjaro/arm-stable/core}
     if [[ "${pkg_from_local_mirror}" ]]; then
         mirror_archlinux=${mirror_archlinux:-http://repo.lan:9129/repo/archlinux}
         mirror_archlinuxarm=${mirror_alarm:-http://repo.lan:9129/repo/archlinuxarm}
@@ -164,8 +145,16 @@ config_repos() {
         fi
         mirror_7Ji=${mirror_7Ji:-https://github.com/7Ji/archrepo/releases/download}
     fi
-    # Mainly for pacman-static
-    repo_url_archlinuxcn_x86_64="${mirror_archlinuxcn}"/x86_64
+    # Host pacman: on aarch64 hosts build natively with Manjaro ARM's static
+    # pacman; on x86_64 hosts cross-build with archlinuxcn's static pacman.
+    if [[ "$(uname -m)" == 'aarch64' ]]; then
+        repo_url_pacman_host="${mirror_pacman_static}"/aarch64
+        repo_name_pacman_host=core
+    else
+        repo_url_archlinuxcn_x86_64="${mirror_archlinuxcn}"/x86_64
+        repo_url_pacman_host="${repo_url_archlinuxcn_x86_64}"
+        repo_name_pacman_host=archlinuxcn
+    fi
     # For base system packages
     repo_url_alarm_aarch64="${mirror_archlinuxarm}"/aarch64/'$repo'
     # For kernels and other stuffs
@@ -173,16 +162,18 @@ config_repos() {
 }
 
 prepare_host_dirs() {
+    # Defensive umounts in case a previous run died without cleaning up
+    umount --lazy cache/root/proc cache/root/dev/pts cache/root/etc/resolv.conf cache/root 2>/dev/null || true
     rm -rf cache
     mkdir -p {bin,cache/root,out,src/pkg}
 }
 
 prepare_pacman_static() {
-    dump_binary_from_repo "${repo_url_archlinuxcn_x86_64}" archlinuxcn pacman-static pacman usr/bin/pacman-static 
+    dump_binary_from_repo "${repo_url_pacman_host}" "${repo_name_pacman_host}" pacman-static pacman usr/bin/pacman-static
 }
 
 mount_root() {
-    mount tmpfs-root cache/root -t tmpfs -o mode=0755,nosuid 
+    mount tmpfs-root cache/root -t tmpfs -o mode=0755,nosuid
     mkdir -p cache/root/{boot,dev/{pts,shm},etc/pacman.d,etc/pacman.d/gnupg,proc,run,sys/module,tmp,var/{cache/pacman/pkg,lib/pacman,log}}
     chmod 1777 cache/root/{dev/shm,tmp}
     chmod 555 cache/root/{proc,sys}
@@ -205,14 +196,16 @@ mount_root() {
 umount_root_sub() {
     chroot cache/root killall -s KILL gpg-agent dirmngr || true
     for node in full null random tty urandom zero pts; do
-        umount --lazy cache/root/dev/"${node}"
+        umount --lazy cache/root/dev/"${node}" 2>/dev/null || true
     done
-    umount --lazy cache/root/proc
+    umount --lazy cache/root/proc 2>/dev/null || true
     rm -rf cache/root/sys/module cache/root/dev/*
 }
 
 prepare_pacman_configs() {
-    # Create temporary pacman config
+    # Host-side pacman config, only used for the bootstrap stage (the root is
+    # empty then, so it cannot run pacman itself yet). Afterwards the target's
+    # own /etc/pacman.conf takes over, see prepare_chroot_pacman().
     pacman_config="
 RootDir      = cache/root
 DBPath       = cache/root/var/lib/pacman/
@@ -235,37 +228,50 @@ Server = ${repo_url_7Ji_aarch64}"
 
     echo "[options]${pacman_config}
 SigLevel = Never${pacman_mirrors}" > cache/pacman-loose.conf
+}
 
-    echo "[options]${pacman_config}
-SigLevel = DatabaseOptional${pacman_mirrors}" > cache/pacman-strict.conf
+prepare_chroot_pacman() {
+    # Write the target's own pacman config. All subsequent pacman runs happen
+    # inside the chroot with this config, so hooks and scriptlets execute
+    # natively in the target arch.
+    cat > cache/root/etc/pacman.conf <<EOF
+[options]
+HoldPkg      = pacman glibc
+Architecture = aarch64
+SigLevel = DatabaseOptional
 
-    # Installing the initramfs tool (mkinitcpio/booster) fires its own
-    # post-transaction hook in the SAME transaction, before we can rename the
-    # hook file below. That hook either fails (booster: find on a missing
-    # /usr/lib/modules) or hangs regenerating images through slow qemu
-    # (mkinitcpio). Use NoExtract so hook files never land in the rootfs during
-    # those two installs. --hookdir only appends dirs and --nohooks needs
-    # pacman 6.0+, so neither is reliable with the static pacman here.
-    sed '/^SigLevel = DatabaseOptional$/a NoExtract = usr/share/libalpm/hooks/*' \
-        cache/pacman-strict.conf > cache/pacman-nohooks.conf
-
+[core]
+Server = ${repo_url_alarm_aarch64}
+[extra]
+Server = ${repo_url_alarm_aarch64}
+[alarm]
+Server = ${repo_url_alarm_aarch64}
+[aur]
+Server = ${repo_url_alarm_aarch64}
+[7Ji]
+Server = ${repo_url_7Ji_aarch64}
+EOF
     # For installing local .pkg.tar.zst files that carry no detached signature
-    sed 's/^SigLevel = .*/SigLevel = Never/' cache/pacman-strict.conf > cache/pacman-local.conf
+    sed 's/^SigLevel = .*/SigLevel = Never/' cache/root/etc/pacman.conf > cache/root/etc/pacman-local.conf
+    # chroot pacman downloads packages itself, give it DNS
+    enable_network
 }
 
 enable_network() {
     cat /etc/resolv.conf > cache/resolv.conf
+    # resolv.conf in a fresh ALARM root is a symlink into /run, replace it
+    # with a plain file so the bind mount below has a real target
+    rm -f cache/root/etc/resolv.conf
+    touch cache/root/etc/resolv.conf
     mount cache/resolv.conf cache/root/etc/resolv.conf -o bind
 }
 
 disable_network() {
-    umount cache/root/etc/resolv.conf
+    umount cache/root/etc/resolv.conf 2>/dev/null || true
 }
 
 bootstrap_root() {
     pacman_could_retry -Sy --config cache/pacman-loose.conf --noconfirm "${install_pkgs_bootstrap[@]}"
-    echo '[7Ji]
-Server = https://github.com/7Ji/archrepo/releases/download/$arch' >> cache/root/etc/pacman.conf
     enable_network
     rm -rf cache/root/etc/pacman.d/gnupg
     # GnuPG > 2.4.3-2 does not like SHA1 only key, which is what ALARM Builder uses
@@ -275,117 +281,85 @@ Server = https://github.com/7Ji/archrepo/releases/download/$arch' >> cache/root/
 }
 
 install_initramfs() {
-    # This is a huge hack, basically we disable post-transaction hook that would 
-    # call mkinitcpio, so mkinitcpio won't be called in target, then we run 
-    # mkinitcpio manually, with compression disabled, and also only create
-    # fallback initcpio.
-    # We then compress the initcpio on host.
-    # This avoids the performance penalty if mkinitcpio runs with compression in
-    # target, as qemu is not that efficient
+    # Install the chosen provider BEFORE the kernel. Every kernel package
+    # depends on the virtual "initramfs" package; with the provider already
+    # installed, pacman won't pull in the other one. The alpm hook then builds
+    # the images automatically while the kernel is installed (standard Arch
+    # behaviour), running natively here in the chroot.
     if [[ "${initramfs}" == 'booster' ]]; then
-        # booster ships a post-transaction hook that runs regenerate_images,
-        # which does `find /usr/lib/modules`. No kernel is installed yet at
-        # this stage, so that find fails and the hook (hence this pacman run)
-        # aborts. Create the directory first so the hook finds it (empty is
-        # fine and harmless); the real image is built later in setup_kernel().
+        # booster's install hook runs regenerate_images -> `find /usr/lib/modules`.
+        # No kernel is present yet, so create the directory to keep that hook
+        # happy. booster.yaml must exist before the kernel lands, because that
+        # is when the hook actually generates the images.
         mkdir -p cache/root/usr/lib/modules
-        pacman_could_retry -S --config cache/pacman-nohooks.conf --noconfirm booster
         printf '%s: %s\n' \
-            'compression' 'none' \
             'universal' 'true' > cache/root/etc/booster.yaml
-        # base pulls in mkinitcpio and its install hook. With booster we still
-        # must disable that hook, otherwise installing a kernel package later
-        # triggers mkinitcpio on the host (where it cannot run), which makes
-        # pacman fail or hang. restore it in unhack_initramfs().
-        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
-        [[ -f "${mkinitcpio_install_hook}" ]] && mv "${mkinitcpio_install_hook}"{,.pacsave}
-        # Likewise disable booster's own hook: installing the kernel later
-        # would otherwise regenerate images inside the target, which is
-        # exactly what setup_kernel() does manually (and compresses). Restore
-        # it in unhack_initramfs() so the final image keeps the hook.
-        local booster_hook
-        for booster_hook in cache/root/usr/share/libalpm/hooks/*booster*.hook; do
-            [[ -f "${booster_hook}" ]] && mv "${booster_hook}"{,.pacsave}
-        done
+        pacman_chroot --needed --noconfirm -S booster
     else
-        # The mkinitcpio package ships 90-mkinitcpio-install.hook, which fires
-        # during this very install (no kernel/preset yet) and hangs running the
-        # aarch64 generator via qemu. Install with hooks excluded via NoExtract.
-        pacman_could_retry -S --config cache/pacman-nohooks.conf --noconfirm mkinitcpio
-        local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
-        cp "${mkinitcpio_conf}"{,.pacsave}
-        echo 'COMPRESSION=cat' >> "${mkinitcpio_conf}"
-        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
-        [[ -f "${mkinitcpio_install_hook}" ]] && mv "${mkinitcpio_install_hook}"{,.pacsave}
+        pacman_chroot --needed --noconfirm -S mkinitcpio
+        # Temporary hack before https://gitlab.archlinux.org/archlinux/mkinitcpio/mkinitcpio/-/issues/218 is resolved.
+        # Must run before the kernel lands, since that is when the hook reads
+        # mkinitcpio.conf to build the images.
+        sed -i 's/ kms / /' cache/root/etc/mkinitcpio.conf
     fi
 }
 
-unhack_initramfs() {
-    if [[ "${initramfs}" == 'booster' ]]; then
-        printf '%s: %s\n' \
-            'universal' 'true' > cache/root/etc/booster.yaml
-        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
-        [[ -f "${mkinitcpio_install_hook}.pacsave" ]] && mv "${mkinitcpio_install_hook}"{.pacsave,}
-        local booster_hook
-        for booster_hook in cache/root/usr/share/libalpm/hooks/*booster*.hook.pacsave; do
-            [[ -f "${booster_hook}" ]] || continue
-            mv "${booster_hook}" "${booster_hook%.pacsave}"
-        done
-    else
-        local mkinitcpio_conf=cache/root/etc/mkinitcpio.conf
-        local mkinitcpio_install_hook=cache/root/usr/share/libalpm/hooks/90-mkinitcpio-install.hook
-        mv "${mkinitcpio_conf}"{.pacsave,}
-        [[ -f "${mkinitcpio_install_hook}.pacsave" ]] && mv "${mkinitcpio_install_hook}"{.pacsave,}
-    fi
-}
-
-setup_kernel() {
-    if [[ ${#install_pkgs_kernel[@]} == 0 ]]; then
-        return
-    fi
-    for module_dir in cache/root/usr/lib/modules/*; do
-        cp "${module_dir}"/vmlinuz cache/root/boot/vmlinuz-$(<"${module_dir}"/pkgbase)
+setup_initramfs() {
+    # The alpm hook generated the images during kernel installation. This
+    # stage only normalizes booster's image names (it may use the kernel
+    # release instead of pkgbase), makes sure vmlinuz is in /boot (booster's
+    # hook does not do that), and regenerates explicitly if an image is
+    # missing for any reason.
+    [[ ${#install_pkgs_kernel[@]} == 0 ]] && return
+    local vmlinuz kbase kernel img stem known regenerated=
+    for vmlinuz in cache/root/usr/lib/modules/*/vmlinuz; do
+        [[ -e "${vmlinuz}" ]] || continue
+        kbase=$(cat "${vmlinuz%/vmlinuz}/pkgbase" 2>/dev/null) || kbase=
+        [[ -n "${kbase}" ]] || continue
+        [[ -e cache/root/boot/vmlinuz-"${kbase}" ]] || \
+            cp "${vmlinuz}" cache/root/boot/vmlinuz-"${kbase}"
     done
     if [[ "${initramfs}" == 'booster' ]]; then
-        chroot cache/root /usr/lib/booster/regenerate_images
-    else
-        # The 90-mkinitcpio-install hook was disabled in install_initramfs()
-        # to avoid running mkinitcpio in target. That hook is also what
-        # normally creates /etc/mkinitcpio.d/*.preset when a kernel is
-        # installed, so `mkinitcpio -P` would otherwise fail with
-        # "No presets found in /etc/mkinitcpio.d". Recreate the presets
-        # ourselves from the installed kernel modules.
-        mkdir -p cache/root/etc/mkinitcpio.d
-        local module_dir kver kbase preset
-        for module_dir in cache/root/usr/lib/modules/*; do
-            [[ -d "${module_dir}" ]] || continue
-            kver=$(basename "${module_dir}")
-            kbase=$(<"${module_dir}"/pkgbase 2>/dev/null)
-            [[ -n "${kbase}" ]] || continue
-            preset="cache/root/etc/mkinitcpio.d/${kbase}.preset"
-            cat > "${preset}" <<EOF
-ALL_config="/etc/mkinitcpio.conf"
-ALL_kver="/boot/vmlinuz-${kbase}"
-PRESETS=('fallback')
-fallback_image="/boot/initramfs-${kbase}-fallback.img"
-fallback_options="-S autodetect"
-EOF
-            echo "=> Created mkinitcpio preset '${kbase}' for kernel ${kver}"
+        for img in cache/root/boot/booster-*.img; do
+            [[ -e "${img}" ]] || continue
+            stem=$(basename "${img}")
+            stem=${stem#booster-}
+            stem=${stem%.img}
+            known=
+            for kernel in "${install_pkgs_kernel[@]}"; do
+                [[ "${stem}" == "${kernel}" ]] && known='yes' && break
+            done
+            [[ -n "${known}" ]] && continue
+            for kernel in "${install_pkgs_kernel[@]}"; do
+                if [[ ! -f cache/root/boot/booster-"${kernel}".img ]]; then
+                    mv "${img}" cache/root/boot/booster-"${kernel}".img
+                    echo "=> Renamed $(basename "${img}") -> booster-${kernel}.img"
+                    break
+                fi
+            done
         done
-        chroot cache/root mkinitcpio -P
+        for kernel in "${install_pkgs_kernel[@]}"; do
+            [[ -f cache/root/boot/booster-"${kernel}".img && -z "${regenerated}" ]] || continue
+            echo "=> booster image for '${kernel}' missing, regenerating in chroot"
+            chroot cache/root /usr/lib/booster/regenerate_images
+            regenerated='yes'
+        done
+        for kernel in "${install_pkgs_kernel[@]}"; do
+            [[ -f cache/root/boot/booster-"${kernel}".img ]] || \
+                echo "WARNING: booster image for '${kernel}' not found in /boot"
+        done
+    else
+        for kernel in "${install_pkgs_kernel[@]}"; do
+            [[ -f cache/root/boot/initramfs-"${kernel}"-fallback.img ]] && continue
+            echo "=> initramfs for '${kernel}' missing, regenerating in chroot"
+            chroot cache/root mkinitcpio -P
+            break
+        done
+        for kernel in "${install_pkgs_kernel[@]}"; do
+            [[ -f cache/root/boot/initramfs-"${kernel}"-fallback.img ]] || \
+                echo "WARNING: initramfs for '${kernel}' not found in /boot"
+        done
     fi
-    # Manually compress
-    local kernel file_initramfs
-    for kernel in "${install_pkgs_kernel[@]}"; do
-        if [[ "${initramfs}" == 'booster' ]]; then
-            local file_initramfs=cache/root/boot/booster-"${kernel}".img
-        else
-            local file_initramfs=cache/root/boot/initramfs-"${kernel}"-fallback.img
-        fi
-        zstd -T0 "${file_initramfs}"
-        mv "${file_initramfs}"{.zst,}
-    done
-    # chroot cache/root img2uimg
 }
 
 setup_extlinux() {
@@ -440,15 +414,19 @@ DEFAULT ${install_pkgs_kernel[0]}" > "${conf}"
 }
 
 install_pkgs() {
-    pacman_could_retry -S --config cache/pacman-strict.conf --noconfirm "${install_pkgs_kernel[@]}" "${install_pkgs_normal[@]}"
+    # The initramfs provider was installed by install_initramfs() first, so
+    # the alpm hook builds the images automatically as each kernel lands.
+    pacman_chroot -Sy --needed --noconfirm "${install_pkgs_kernel[@]}" "${install_pkgs_normal[@]}"
 }
 
 install_kernel_pkgs() {
     # Download (or copy) user-supplied .pkg.tar.zst kernel packages, install
-    # them with pacman -U, and register their pkgbase into install_pkgs_kernel
-    # so setup_kernel()/setup_extlinux() build the initramfs and boot entries.
+    # them with chroot pacman -U, and register their pkgbase into
+    # install_pkgs_kernel so setup_initramfs()/setup_extlinux() build the
+    # initramfs and boot entries.
     [[ ${#install_pkgs_kernel_pkg[@]} -eq 0 ]] && return
     local src file name pkgbase seen duplicated
+    mkdir -p cache/root/var/cache/pacman/pkg
     for src in "${install_pkgs_kernel_pkg[@]}"; do
         if [[ "${src}" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
             name="${src##*/}"
@@ -463,11 +441,13 @@ install_kernel_pkgs() {
         [[ -f "${file}" ]] || { echo "ERROR: Kernel package '${file}' not found"; exit 1; }
         [[ "${file}" == *.pkg.tar.zst ]] || echo "Warning: '${file}' does not look like a .pkg.tar.zst"
 
-        # Local packages have no detached signature, so relax SigLevel via a
-        # dedicated config that keeps the repos for dependency resolution.
-        pacman_could_retry -U --config cache/pacman-local.conf --noconfirm "${file}"
+        # The package file must be visible inside the chroot for pacman -U
+        name=$(basename "${file}")
+        cp -f "${file}" cache/root/var/cache/pacman/pkg/"${name}"
+        # Local packages have no detached signature, use the Never config
+        pacman_chroot -U --config /etc/pacman-local.conf --noconfirm "/var/cache/pacman/pkg/${name}"
 
-        # setup_kernel() compresses initramfs by kernel name, fall back to
+        # setup_initramfs() builds images per kernel name, fall back to
         # pkgname when the package is not a split package (no pkgbase).
         pkgbase=$(bsdtar -xOf "${file}" .PKGINFO 2>/dev/null | sed -n 's/^pkgbase = //p')
         [[ -n "${pkgbase}" ]] || pkgbase=$(bsdtar -xOf "${file}" .PKGINFO 2>/dev/null | sed -n 's/^pkgname = //p')
@@ -486,14 +466,14 @@ install_kernel_pkgs() {
 
 install_local_pkgs() {
     # Download (or copy) arbitrary user-supplied .pkg.tar.zst packages and
-    # install them with pacman -U. Unlike install_kernel_pkgs() these are not
-    # registered as kernels, so no initramfs / boot entry is generated for
-    # them. All packages are passed to a single -U call so dependencies
+    # install them with chroot pacman -U. Unlike install_kernel_pkgs() these
+    # are not registered as kernels, so no initramfs / boot entry is generated
+    # for them. All packages are passed to a single -U call so dependencies
     # between the supplied packages can be resolved together.
     [[ ${#install_pkgs_local[@]} -eq 0 ]] && return
     local src file name
     local files=()
-    mkdir -p cache/local-pkg
+    mkdir -p cache/local-pkg cache/root/var/cache/pacman/pkg
     for src in "${install_pkgs_local[@]}"; do
         if [[ "${src}" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]]; then
             name="${src##*/}"
@@ -507,16 +487,19 @@ install_local_pkgs() {
         [[ -f "${file}" ]] || { echo "ERROR: Package '${file}' not found"; exit 1; }
         [[ "${file}" == *.pkg.tar.zst ]] || echo "Warning: '${file}' does not look like a .pkg.tar.zst"
         echo "=> Adding package '${file}'"
-        files+=("${file}")
+        name=$(basename "${file}")
+        cp -f "${file}" cache/root/var/cache/pacman/pkg/"${name}"
+        files+=("/var/cache/pacman/pkg/${name}")
     done
-    pacman_could_retry -U --config cache/pacman-local.conf --noconfirm "${files[@]}"
+    pacman_chroot -U --config /etc/pacman-local.conf --noconfirm "${files[@]}"
 }
 
 cleanup_pkgs() {
-    bin/pacman -Sc --config cache/pacman-strict.conf --noconfirm
+    pacman_chroot -Sc --noconfirm
 }
 
 setup_root() {
+    disable_network
     # /etc/fstab
     echo "# root partition with ext4 on SDcard / USB drive
 UUID=${uuid_root}	/	ext4	rw,noatime	0 1
@@ -541,9 +524,6 @@ UUID=${uuid_boot_specifier}	/boot	vfat	rw,noatime	0 2" >>  cache/root/etc/fstab
 
     # Actual resolv
     ln -sf /run/systemd/resolve/resolv.conf cache/root/etc/resolv.conf
-
-    # Temporary hack before https://gitlab.archlinux.org/archlinux/mkinitcpio/mkinitcpio/-/issues/218 is resolved
-    [[ "${initramfs}" != booster ]] && sed -i 's/ kms / /'  cache/root/etc/mkinitcpio.conf
 
     # Things that need to bone inside the root
     chroot cache/root /bin/bash -ec "locale-gen
@@ -588,74 +568,6 @@ release() {
     wait ${pids_gzip[@]}
 }
 
-get_subid() { #1 name #2 uid, #3 type
-    local subid=$(grep '^'"$1"':[0-9]\+:[0-9]\+$' /etc/"$3" | tail -1)
-    if [[ -z "${subid}" ]]; then
-        subid=$(grep '^'"$2"':[0-9]\+:[0-9]\+$' /etc/"$3" | tail -1)
-    fi
-    if [[ -z "${subid}" ]]; then
-        echo "ERROR: failed to get $3 for current user"
-        exit 1
-    fi
-    echo "${subid}"
-}
-
-spawn_and_wait() {
-    local username=$(id --user --name)
-    if [[ -z "${username}" ]]; then
-        echo 'ERROR: Failed to get user name of current user'
-        exit 1
-    fi
-    local subuid=$(get_subid "${username}" "${uid}" subuid)
-    local subgid=$(get_subid "${username}" "${uid}" subgid)
-    local uid_range="${subuid##*:}"
-    # We need to map the user to 0:0, and others to 1:65535
-    if [[ "${uid_range}" -lt 65535 ]]; then
-        echo 'ERROR: subuid range too short'
-        exit 1
-    fi
-    local gid_range="${subgid##*:}"
-    if [[ "${gid_range}" -lt 65535 ]]; then
-        echo 'ERROR: subgid range too short'
-        exit 1
-    fi
-    local uid_start="${subuid#*:}"
-    uid_start="${uid_start%:*}"
-    local gid_start="${subgid#*:}"
-    gid_start="${gid_start%:*}"
-    
-    local args=()
-    local arg=
-    for arg in "${install_pkgs_bootstrap[@]}"; do
-        args+=(--install-bootstrap "$arg")
-    done
-    for arg in "${install_pkgs_normal[@]}"; do
-        args+=(--install "$arg")
-    done
-    for arg in "${install_pkgs_kernel[@]}"; do
-        args+=(--install-kernel "$arg")
-    done
-    for arg in "${install_pkgs_kernel_pkg[@]}"; do
-        args+=(--install-kernel-pkg "$arg")
-    done
-    for arg in "${install_pkgs_local[@]}"; do
-        args+=(--install-local-pkg "$arg")
-    done
-    # Note: the options --map-users and --map-groups were added to unshare.1 in 
-    # util-linux 2.38, which was released on Mar 28, 2022. But the main distro
-    # I aim, Ubuntu 22.04, which is what Github Actions use, packs an older
-    # util-linux 2.37, which does not have those arguments. So we have to work
-    # around this by calling newuidmap and newgidmap directly.
-    unshare --user --pid --mount --fork \
-        /bin/bash -e "${arg0}" --role child --uuid-root "${uuid_root}" --uuid-boot "${uuid_boot}" --build-id "${build_id}"  "${args[@]}" &
-    child_pid="$!"
-    sleep 1
-    newuidmap "${child_pid}" 0 "${uid}" 1 1 "${uid_start}" 65535
-    newgidmap "${child_pid}" 0 "${gid}" 1 1 "${gid_start}" 65535
-    wait "${child_pid}"
-    child_pid=
-}
-
 prepare_host() {
     prepare_host_dirs
     config_repos
@@ -686,38 +598,35 @@ cleanup_cache() {
     rm -rf cache
 }
 
-work_parent() {
-    check_identity_non_root
-    trap "cleanup_parent" INT TERM EXIT
+work_build() {
+    check_identity_root
+    if [[ "$(uname -m)" != 'aarch64' ]]; then
+        # On x86_64 the aarch64 binaries inside the chroot run through qemu
+        if [[ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+            echo "INFO: qemu-aarch64 binfmt registered, aarch64 chroot will work" >&2
+        else
+            echo "WARNING: host is $(uname -m) but qemu-aarch64 binfmt_misc is NOT registered." >&2
+            echo "         Install it with: apt install qemu-user-static && sudo systemctl restart systemd-binfmt" >&2
+            echo "         Otherwise every chroot command will fail with 'Exec format error'." >&2
+        fi
+    fi
+    trap "cleanup_build" INT TERM EXIT
     prepare_host
-    spawn_and_wait
+    local stage
+    for stage in mount_root bootstrap_root prepare_chroot_pacman install_initramfs \
+                 install_pkgs install_kernel_pkgs install_local_pkgs setup_initramfs \
+                 setup_root setup_extlinux cleanup_pkgs umount_root_sub \
+                 archive_root image_boot cleanup_boot image_root; do
+        echo "=== [$(date -u +%H:%M:%S)] STAGE: ${stage} ===" >&2
+        "${stage}"
+    done
+    echo "=== [$(date -u +%H:%M:%S)] ALL STAGES DONE ===" >&2
     # The child should have the following artifacts: cache/root.img cache/boot.img cache/extlinux.conf
-    # And the child should have already finished out/*-root.tar
+    # And the stages should have already finished out/*-root.tar
     image_disk
     release
+    trap - INT TERM EXIT
     cleanup_cache
-}
-
-work_child() {
-    sleep 3
-    check_identity_map_root
-    trap "cleanup_child" INT TERM EXIT
-    mount_root
-    bootstrap_root
-    install_initramfs
-    install_pkgs
-    install_kernel_pkgs
-    install_local_pkgs
-    setup_root
-    setup_kernel
-    setup_extlinux
-    unhack_initramfs
-    cleanup_pkgs
-    umount_root_sub
-    archive_root
-    image_boot
-    cleanup_boot
-    image_root
 }
 
 # Common main routine
@@ -732,10 +641,8 @@ uuid_boot=''
 uuid_boot_mkfs=''
 uuid_boot_specifier=''
 
-arg0="$0"
 argv=("$@")
 argc=$#
-role='parent'
 
 i=0
 while [[ $i -lt ${argc} ]]; do
@@ -759,10 +666,6 @@ while [[ $i -lt ${argc} ]]; do
         --install-local-pkg)
             i=$(( $i + 1 ))
             install_pkgs_local+=("${argv[$i]}")
-            ;;
-        --role)
-            i=$(( $i + 1 ))
-            role="${argv[$i]}"
             ;;
         --uuid-root)
             i=$(( $i + 1 ))
@@ -799,7 +702,7 @@ fi
 if [[ "${#install_pkgs_bootstrap[@]}" == 0 ]]; then
     install_pkgs_bootstrap=(base archlinuxarm-keyring 7ji-keyring)
 fi
-    
+
 if [[ "${#install_pkgs_normal[@]}" == 0 ]]; then
     # linux-aarch64-flippy-git-dtb-amlogic and ampart were dropped from the
     # 7Ji repo; use ampart-git which is still published there.
@@ -825,11 +728,4 @@ uuid_boot_mkfs=${uuid_boot_mkfs^^}
 uuid_boot_specifier="${uuid_boot_mkfs::4}-${uuid_boot_mkfs:4}"
 initramfs="${initramfs:-booster}"
 
-case "${role}" in
-    parent) work_parent;;
-    child) work_child;;
-    *)
-        echo 'ERROR: Role invalid: '"${role}"
-        exit 1
-        ;;
-esac
+work_build
